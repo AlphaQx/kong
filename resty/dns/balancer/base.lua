@@ -177,6 +177,7 @@ local errors = setmetatable({
 
 
 local _balancers = setmetatable({}, { __mode = "k" })
+local _expire_records_timer = nil
 
 local _M = {}
 
@@ -188,6 +189,21 @@ local objHost = {}
 local mt_objHost = { __index = objHost }
 local objBalancer = {}
 local mt_objBalancer = { __index = objBalancer }
+
+local function check_for_expired_records()
+  for balancer in pairs(_balancers) do
+    --check all hosts for expired records,
+    --including those with errors
+    --we update, so changes on the list while traversing can happen, keep track of that
+    for _, host in ipairs(balancer.hosts) do
+      -- only retry the errored ones
+      if ((host.lastQuery or EMPTY).expire or 0) < time() then
+        ngx_log(ngx_DEBUG, balancer.log_prefix, "executing requery for: ", host.hostname)
+        host:queryDns(false) -- timer-context; cacheOnly always false
+      end
+    end
+  end
+end
 
 ------------------------------------------------------------------------------
 -- Implementation properties.
@@ -1423,37 +1439,21 @@ _M.new = function(opts)
   self:setCallback(opts.callback or function() end) -- callback for address mutations
 
   _balancers[self] = true
-
-  ngx_log(ngx_DEBUG, self.log_prefix, "balancer_base created")
-  return self
-end
-
-
-do
-  local function check_for_expired_records()
-    for balancer in pairs(_balancers) do
-      --check all hosts for expired records,
-      --including those with errors
-      --we update, so changes on the list while traversing can happen, keep track of that
-      for _, host in ipairs(balancer.hosts) do
-        -- only retry the errored ones
-        if ((host.lastQuery or EMPTY).expire or 0) < time() then
-          ngx_log(ngx_DEBUG, balancer.log_prefix, "executing requery for: ", host.hostname)
-          host:queryDns(false) -- timer-context; cacheOnly always false
-        end
-      end
+  if not _expire_records_timer then
+    local err
+    _expire_records_timer, err = resty_timer({
+      recurring = true,
+      interval = 1, -- check for expired records every 1 second
+      detached = true,
+      expire = check_for_expired_records,
+    })
+    if not _expire_records_timer then
+      error("failed to create expire records timer for background DNS resolution: " .. err)
     end
   end
 
-  local ok, err = resty_timer({
-    recurring = true,
-    interval = 1, -- check for expired records every 1 second
-    detached = true,
-    expire = check_for_expired_records,
-  })
-  if not ok then
-    error("failed to create timer for background DNS resolution: " .. err)
-  end
+  ngx_log(ngx_DEBUG, self.log_prefix, "balancer_base created")
+  return self
 end
 
 -- export the error constants
